@@ -1,7 +1,7 @@
 {
   "name": "@inscada/web-components",
-  "version": "0.1.3",
-  "description": "inSCADA Web Components - Live SCADA data in custom menus with a single HTML tag",
+  "version": "0.3.0",
+  "description": "inSCADA Web Components - Live SCADA data and Faceplate rendering in custom menus",
   "type": "module",
   "main": "src/index.js",
   "files": [
@@ -19,6 +19,7 @@
     "scada",
     "web-components",
     "live-value",
+    "faceplate",
     "industrial"
   ],
   "license": "MIT"
