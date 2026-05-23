@@ -1,15 +1,15 @@
 /**
- * <ins-faceplate> — Render an inSCADA Faceplate as a Web Component
+ * <ins-faceplate> — Render an inSCADA Faceplate as a Web Component.
  *
- * Loads a faceplate definition (SVG + animation elements + placeholders)
- * from the inSCADA REST API, substitutes placeholder values from attributes,
- * evaluates element expressions periodically, and renders live SVG.
+ * Loads a faceplate (SVG + animation elements + placeholders) from the
+ * inSCADA REST API via the Transport layer, substitutes placeholder values
+ * from attributes, evaluates element expressions periodically, and renders
+ * live SVG with animated bindings.
  *
- * Usage:
+ * Usage (JDK21 — project = project NAME, string):
  *   <ins-faceplate
- *     project="153"
+ *     project="AYBIGE_HES"
  *     name="Motor_Standard"
- *     space="claude"
  *     duration="2000"
  *     motor_name="Motor 1"
  *     speed_var="M1_Speed"
@@ -17,22 +17,28 @@
  *   </ins-faceplate>
  *
  * Attributes:
- *   project   — Project ID (required)
+ *   project   — Project NAME (required, JDK21)
  *   name      — Faceplate name (required)
- *   space     — Space name (default: "default_space")
  *   duration  — Refresh interval in ms (default: 2000)
- *   width     — SVG width (default: auto)
+ *   width     — SVG width (default: 100%)
  *   height    — SVG height (default: auto)
- *   Any other attribute is treated as a placeholder value.
+ *   Any other attribute is treated as a placeholder value ($name$ substitution).
  */
 
-const RESERVED_ATTRS = new Set(['project', 'name', 'space', 'duration', 'width', 'height', 'style', 'class', 'id']);
+import { getTransport } from './transport/index.js';
+
+const RESERVED_ATTRS = new Set([
+  'project', 'name', 'duration', 'width', 'height', 'style', 'class', 'id',
+  // Kept for backward-compat with v0.x examples; ignored as placeholders.
+  'space',
+]);
 
 export default class InsFaceplate extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
     this._faceplate = null;
+    this._projectId = null;
     this._elements = [];
     this._placeholders = {};
     this._timer = null;
@@ -40,7 +46,7 @@ export default class InsFaceplate extends HTMLElement {
   }
 
   static get observedAttributes() {
-    return ['project', 'name', 'space', 'duration'];
+    return ['project', 'name', 'duration'];
   }
 
   connectedCallback() {
@@ -59,11 +65,10 @@ export default class InsFaceplate extends HTMLElement {
   }
 
   get project() { return this.getAttribute('project'); }
-  get facplateName() { return this.getAttribute('name'); }
-  get space() { return this.getAttribute('space') || 'default_space'; }
+  get faceplateName() { return this.getAttribute('name'); }
   get duration() { return parseInt(this.getAttribute('duration') || '2000', 10); }
 
-  /** Collect all non-reserved attributes as placeholder values */
+  /** Collect non-reserved attributes as placeholder values */
   _getPlaceholderValues() {
     const values = {};
     for (const attr of this.attributes) {
@@ -74,7 +79,7 @@ export default class InsFaceplate extends HTMLElement {
     return values;
   }
 
-  /** Initial loading indicator */
+  /** Initial loading state */
   _render() {
     const w = this.getAttribute('width') || '100%';
     const h = this.getAttribute('height') || 'auto';
@@ -92,64 +97,31 @@ export default class InsFaceplate extends HTMLElement {
     `;
   }
 
-  /** Load faceplate from REST API */
+  /** Load faceplate via Transport (handles same-origin / proxy auto-detect) */
   async _load() {
-    const projectId = this.project;
-    const name = this.facplateName;
-    if (!projectId || !name) {
+    const projectName = this.project;
+    const fpName = this.faceplateName;
+    if (!projectName || !fpName) {
       this._showError('Missing project or name attribute');
       return;
     }
 
     try {
-      // Fetch faceplate by project and name
-      const fpResp = await fetch(
-        `/api/faceplates/project/names?projectId=${projectId}&names=${encodeURIComponent(name)}`,
-        { credentials: 'include', headers: { 'X-Space': this.space } }
-      );
-      const fpData = await fpResp.json();
-      const fp = Array.isArray(fpData) ? fpData[0] : fpData[name];
+      const transport = getTransport();
+      const { def, projectId, svg, elements, placeholders } =
+        await transport.loadFaceplate(projectName, fpName);
 
-      if (!fp) {
-        this._showError(`Faceplate "${name}" not found in project ${projectId}`);
-        return;
-      }
-
-      this._faceplate = fp;
-
-      // Fetch SVG content
-      const svgResp = await fetch(
-        `/api/faceplates/${fp.id}/svg`,
-        { credentials: 'include', headers: { 'X-Space': this.space } }
-      );
-      const svgContent = await svgResp.text();
-
-      // Fetch elements (animation bindings)
-      const elemResp = await fetch(
-        `/api/faceplates/${fp.id}/elements`,
-        { credentials: 'include', headers: { 'X-Space': this.space } }
-      );
-      this._elements = await elemResp.json();
-
-      // Fetch placeholders definition
-      const phResp = await fetch(
-        `/api/faceplates/${fp.id}/placeholders`,
-        { credentials: 'include', headers: { 'X-Space': this.space } }
-      );
-      const placeholderDefs = await phResp.json();
-
-      // Get placeholder values from attributes
+      this._faceplate = def;
+      this._projectId = projectId;
+      this._elements = elements || [];
+      this._placeholderDefs = placeholders || [];
       this._placeholders = this._getPlaceholderValues();
 
-      // Render SVG
-      this._renderSvg(svgContent);
+      this._renderSvg(svg);
       this._loaded = true;
-
-      // Start polling for live data
       this._startPolling();
-
     } catch (err) {
-      this._showError('Failed to load faceplate: ' + err.message);
+      this._showError('Failed to load faceplate: ' + (err?.message || err));
     }
   }
 
@@ -162,7 +134,6 @@ export default class InsFaceplate extends HTMLElement {
 
     container.innerHTML = svgContent;
 
-    // Set SVG dimensions
     const svg = container.querySelector('svg');
     if (svg) {
       if (w !== 'auto') svg.style.width = w;
@@ -180,13 +151,10 @@ export default class InsFaceplate extends HTMLElement {
     return result;
   }
 
-  /** Evaluate all element expressions in a single batch API call */
+  /** Evaluate all element expressions in a single ad-hoc script call */
   async _evaluate() {
     if (!this._faceplate || this._elements.length === 0) return;
 
-    const projectId = this.project;
-
-    // Separate TEXT elements (no execution needed) from EXPRESSION elements
     const textElems = [];
     const exprElems = [];
 
@@ -199,63 +167,43 @@ export default class InsFaceplate extends HTMLElement {
       }
     }
 
-    // Apply TEXT values immediately
-    for (const { elem, value } of textElems) {
-      this._applyValue(elem, value);
-    }
+    // Apply TEXT values immediately (no backend call)
+    for (const { elem, value } of textElems) this._applyValue(elem, value);
 
-    // Build a single script that evaluates all expressions and returns results as JSON
     if (exprElems.length === 0) return;
 
-    // Each expression wrapped in a safe function, results collected in an object keyed by domId
-    // 'return' works inside functions — keep it if present, add it if missing
+    // Build a single script that evaluates all expressions and returns JSON
     const parts = exprElems.map(({ elem, expression }) => {
       let code = expression.trim();
-      // If expression doesn't contain 'return', add 'return' before the last statement
-      if (!code.includes('return ')) {
-        // Single expression — wrap with return
-        code = 'return ' + code;
-      }
+      if (!code.includes('return ')) code = 'return ' + code;
       return `try { __r["${elem.domId}"] = (function(){ ${code} })(); } catch(e) { __r["${elem.domId}"] = null; }`;
     });
-
     const batchCode = `var __r = {};\n${parts.join('\n')}\nins.toJSONStr(__r);`;
 
     try {
-      const resp = await fetch('/api/scripts/runner', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Space': this.space
-        },
-        body: JSON.stringify({
-          projectId: parseInt(projectId),
-          name: 'faceplate_batch',
-          code: batchCode,
-          log: false,
-          compile: false
-        })
+      const transport = getTransport();
+      const resultText = await transport.runAdHocScript({
+        projectId: this._projectId,
+        name: 'faceplate_batch',
+        code: batchCode,
+        log: false,
+        compile: false,
       });
 
-      if (!resp.ok) return;
-
-      const resultText = await resp.text();
       let results;
       try {
-        results = JSON.parse(resultText);
+        results = typeof resultText === 'string' ? JSON.parse(resultText) : resultText;
       } catch {
-        return;
+        return; // malformed; skip this tick
       }
 
-      // Apply each result to its element
       for (const { elem } of exprElems) {
-        if (elem.domId in results && results[elem.domId] !== null) {
+        if (results && elem.domId in results && results[elem.domId] !== null) {
           this._applyValue(elem, String(results[elem.domId]));
         }
       }
-    } catch (err) {
-      // Silently skip batch evaluation errors
+    } catch (_) {
+      // Silently skip batch evaluation errors; next tick retries
     }
   }
 
@@ -265,7 +213,6 @@ export default class InsFaceplate extends HTMLElement {
                this.shadowRoot.querySelector(`[id="${elem.domId}"]`);
     if (!el) return;
 
-    // Clean up raw value — remove surrounding quotes if present
     let cleaned = rawValue;
     if (typeof cleaned === 'string') {
       cleaned = cleaned.trim();
@@ -276,15 +223,9 @@ export default class InsFaceplate extends HTMLElement {
     }
 
     let value;
-    try {
-      value = JSON.parse(cleaned);
-    } catch {
-      value = cleaned;
-    }
+    try { value = JSON.parse(cleaned); } catch { value = cleaned; }
 
-    const type = elem.type;
-
-    switch (type) {
+    switch (elem.type) {
       case 'Get':
         el.textContent = value != null ? String(value) : '';
         break;
@@ -292,10 +233,8 @@ export default class InsFaceplate extends HTMLElement {
       case 'Color':
         if (typeof value === 'string') {
           if (value.includes('/')) {
-            // Blink between two colors
             const [c1, c2] = value.split('/');
             el.style.fill = c1;
-            // Simple blink via animation
             if (!el._blinkInterval) {
               let toggle = false;
               el._blinkInterval = setInterval(() => {
@@ -377,7 +316,6 @@ export default class InsFaceplate extends HTMLElement {
       }
 
       default:
-        // For unhandled types, try setting textContent
         if (value != null) el.textContent = String(value);
         break;
     }
@@ -385,7 +323,7 @@ export default class InsFaceplate extends HTMLElement {
 
   _startPolling() {
     this._stopPolling();
-    this._evaluate(); // First evaluation
+    this._evaluate();
     this._timer = setInterval(() => this._evaluate(), this.duration);
   }
 
@@ -394,7 +332,6 @@ export default class InsFaceplate extends HTMLElement {
       clearInterval(this._timer);
       this._timer = null;
     }
-    // Clean up blink intervals
     if (this.shadowRoot) {
       this.shadowRoot.querySelectorAll('*').forEach(el => {
         if (el._blinkInterval) { clearInterval(el._blinkInterval); el._blinkInterval = null; }

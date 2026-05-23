@@ -1,17 +1,21 @@
 /**
- * <ins-data-source> — Headless data provider for inSCADA variables.
+ * <ins-variables> — Headless data provider for inSCADA variable values.
  *
  * Subscribes a list of variables via InsDataBus (single batched fetch shared
  * with all other ins-* components on the page) and exposes their values to
  * arbitrary consumers via events, methods, properties, or template binding.
  *
+ * NOTE: Renamed from <ins-data-source> in v1.0 to make the semantic clear
+ *       — this component reads variable values (vs. <ins-fetch> which calls
+ *       arbitrary REST endpoints).
+ *
  * USAGE:
  *
  * 1) Headless (feed any chart/library):
  *
- *    <ins-data-source id="plant" project="153"
+ *    <ins-variables id="plant" project="AYBIGE_HES"
  *      variables="Temp_In, Pressure, Flow_Rate" refresh="2000">
- *    </ins-data-source>
+ *    </ins-variables>
  *
  *    <script>
  *      const plant = document.getElementById('plant');
@@ -33,12 +37,12 @@
  *
  * 2) Template binding (no JS needed):
  *
- *    <ins-data-source project="153" variables="Temp_In, Pressure">
+ *    <ins-variables project="AYBIGE_HES" variables="Temp_In, Pressure">
  *      <template>
  *        <div>Temp: <b data-bind="Temp_In">--</b> °C</div>
  *        <div>Pressure: <b data-bind="Pressure">--</b> bar</div>
  *      </template>
- *    </ins-data-source>
+ *    </ins-variables>
  *
  *    Optional bind modifiers on data-bind elements:
  *      data-bind="Temp_In"           — textContent (default)
@@ -47,21 +51,21 @@
  *      data-bind-style="background"   — set style property
  *
  * Attributes:
- *   project    — Project ID (required)
+ *   project    — Project NAME (JDK21, string, required)
  *   variables  — Comma-separated variable names (required)
- *   space      — Space name (default: "default_space")
+ *   space      — Override space (default: from transport config)
  *   refresh    — Refresh interval ms (default: from InsDataBus, usually 2000)
  *
  * Events:
  *   ins-data-update — fired on every successful refresh
  *     event.detail = { varName: { value, date }, ... }
  *   ins-data-error  — fired on fetch/individual variable error
- *     event.detail = { varName, error }
+ *     event.detail = { variable, error }
  */
 
 import dataBus from './ins-data-bus.js';
 
-class InsDataSource extends HTMLElement {
+class InsVariables extends HTMLElement {
   static get observedAttributes() {
     return ['project', 'variables', 'space', 'refresh'];
   }
@@ -69,7 +73,7 @@ class InsDataSource extends HTMLElement {
   constructor() {
     super();
     this._data = {};                  // { varName: {value, date} }
-    this._subscribed = [];            // [{pid, name, cb}, ...]
+    this._subscribed = [];            // [{project, name, cb}, ...]
     this._jsSubscribers = new Set();  // user .subscribe() callbacks
     this._templateRendered = false;
   }
@@ -82,14 +86,12 @@ class InsDataSource extends HTMLElement {
       this._renderTemplate();
     }
 
-    // Apply refresh override if provided
     const refresh = this.getAttribute('refresh');
     if (refresh) {
       const ms = parseInt(refresh, 10);
       if (!isNaN(ms) && ms >= 500) dataBus.refreshMs = ms;
     }
 
-    // Apply space if provided
     const space = this.getAttribute('space');
     if (space) dataBus.space = space;
 
@@ -117,37 +119,19 @@ class InsDataSource extends HTMLElement {
 
   /* ── Public API ─────────────────────────────────────── */
 
-  /**
-   * Get a single variable value snapshot.
-   * @param {string} name
-   * @returns {{value:any, date:string}|undefined}
-   */
-  getValue(name) {
-    return this._data[name];
-  }
+  /** Get a single variable value snapshot. */
+  getValue(name) { return this._data[name]; }
 
-  /**
-   * Get all current variable values.
-   * @returns {Object<string, {value, date}>}
-   */
-  getValues() {
-    return { ...this._data };
-  }
+  /** Get all current variable values (shallow copy). */
+  getValues() { return { ...this._data }; }
 
   /** Read-only snapshot (alias of getValues). */
-  get data() {
-    return { ...this._data };
-  }
+  get data() { return { ...this._data }; }
 
-  /**
-   * Register a callback called on every data update.
-   * @param {Function} cb — called with full data snapshot
-   * @returns {Function} unsubscribe function
-   */
+  /** Register a callback called on every data update. Returns unsubscribe fn. */
   subscribe(cb) {
     if (typeof cb !== 'function') return () => {};
     this._jsSubscribers.add(cb);
-    // Fire immediately if data already available
     if (Object.keys(this._data).length > 0) {
       try { cb({ ...this._data }); } catch (_) { /* */ }
     }
@@ -157,21 +141,21 @@ class InsDataSource extends HTMLElement {
   /* ── Internal ───────────────────────────────────────── */
 
   _subscribe() {
-    const pid = this.getAttribute('project');
+    const project = this.getAttribute('project');
     const varsAttr = this.getAttribute('variables');
-    if (!pid || !varsAttr) return;
+    if (!project || !varsAttr) return;
 
     const names = varsAttr.split(',').map(s => s.trim()).filter(Boolean);
     for (const name of names) {
       const cb = (entry) => this._onVarUpdate(name, entry);
-      dataBus.subscribe(pid, name, cb);
-      this._subscribed.push({ pid, name, cb });
+      dataBus.subscribe(project, name, cb);
+      this._subscribed.push({ project, name, cb });
     }
   }
 
   _unsubscribe() {
-    for (const { pid, name, cb } of this._subscribed) {
-      dataBus.unsubscribe(pid, name, cb);
+    for (const { project, name, cb } of this._subscribed) {
+      dataBus.unsubscribe(project, name, cb);
     }
     this._subscribed = [];
     this._data = {};
@@ -189,8 +173,8 @@ class InsDataSource extends HTMLElement {
 
     this._data[name] = { value: entry.value, date: entry.date };
 
-    // Fire batched update on microtask — when multiple variables come in the
-    // same tick, listeners only see one event with the full snapshot.
+    // Microtask-batched: when multiple variables arrive in the same tick,
+    // listeners see one event with the full snapshot.
     if (!this._updateScheduled) {
       this._updateScheduled = true;
       Promise.resolve().then(() => {
@@ -203,19 +187,16 @@ class InsDataSource extends HTMLElement {
   _fireUpdate() {
     const snapshot = { ...this._data };
 
-    // CustomEvent
     this.dispatchEvent(new CustomEvent('ins-data-update', {
       detail: snapshot,
       bubbles: true,
       composed: true,
     }));
 
-    // JS subscribers
     for (const cb of this._jsSubscribers) {
       try { cb(snapshot); } catch (_) { /* */ }
     }
 
-    // Template binding
     if (this._templateRendered) {
       this._applyBindings(snapshot);
     }
@@ -226,9 +207,7 @@ class InsDataSource extends HTMLElement {
   _renderTemplate() {
     const tpl = this.querySelector('template');
     if (!tpl) return;
-    // Clone template content next to the <template> element
     const frag = tpl.content.cloneNode(true);
-    // Remove any previously rendered content (re-runs on attribute changes)
     Array.from(this.children).forEach(child => {
       if (child.tagName !== 'TEMPLATE') child.remove();
     });
@@ -245,7 +224,6 @@ class InsDataSource extends HTMLElement {
 
       let value = entry.value;
 
-      // Format modifier
       const fmt = el.getAttribute('data-bind-format');
       if (fmt) {
         const num = Number(value);
@@ -255,25 +233,16 @@ class InsDataSource extends HTMLElement {
         }
       }
 
-      // Attribute binding
       const bindAttr = el.getAttribute('data-bind-attr');
-      if (bindAttr) {
-        el.setAttribute(bindAttr, value);
-        continue;
-      }
+      if (bindAttr) { el.setAttribute(bindAttr, value); continue; }
 
-      // Style binding
       const bindStyle = el.getAttribute('data-bind-style');
-      if (bindStyle) {
-        el.style[bindStyle] = value;
-        continue;
-      }
+      if (bindStyle) { el.style[bindStyle] = value; continue; }
 
-      // Default: textContent
       el.textContent = value;
     }
   }
 }
 
-export { InsDataSource };
-export default InsDataSource;
+export { InsVariables };
+export default InsVariables;

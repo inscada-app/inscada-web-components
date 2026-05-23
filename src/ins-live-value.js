@@ -1,10 +1,13 @@
 /**
  * <ins-live-value> — Canlı SCADA değeri gösteren Web Component.
  *
- * Kullanım:
- *   <ins-live-value project="103" variable="Temp_In" unit="°C"
+ * Kullanım (JDK21 — project = project NAME, string):
+ *   <ins-live-value project="AYBIGE_HES" variable="Temp_In" unit="°C"
  *     label="Sıcaklık" decimals="1" thresholds="0:blue,30:green,60:orange,80:red">
  *   </ins-live-value>
+ *
+ * Auto-detects iframe (uses InscadaApi proxy) vs standalone (uses fetch with
+ * same-origin cookie). All HTTP routes through the Transport layer.
  */
 import dataBus from './ins-data-bus.js';
 
