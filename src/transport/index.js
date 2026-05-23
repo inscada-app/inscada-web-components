@@ -70,12 +70,25 @@ class Transport {
 
   /**
    * Batch variable read (JDK21).
+   *
+   * In iframe mode → uses InscadaApi proxy (api.getVariableValues). This is
+   * REQUIRED in Custom HTML iframes because the iframe is served from the
+   * sandbox origin (inscada.cloud:8083) which does NOT host the /api/
+   * endpoints. The proxy forwards via postMessage → parent SPA → main app
+   * origin where the API lives.
+   *
+   * In standalone mode → direct fetch:
    *   GET /api/variables/values/by-project-name-and-names
    *     ?projectName=X&names=A&names=B
+   *
    * Returns Map<name, {value, date, ...}>.
    */
   async fetchVariables(projectName, names) {
     if (!projectName || !names || names.length === 0) return {};
+    if (this._isIframeWithProxy) {
+      const api = this._getApi(projectName);
+      return api.getVariableValues(names);
+    }
     const namesParams = names.map(n => 'names=' + encodeURIComponent(n)).join('&');
     const url = `${this._baseUrl}/api/variables/values/by-project-name-and-names` +
                 `?projectName=${encodeURIComponent(projectName)}&${namesParams}`;
