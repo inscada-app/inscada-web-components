@@ -22,5 +22,14 @@
     "faceplate",
     "industrial"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "author": "INS Yazilim Sanayi ve Ticaret A.S.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inscada-app/inscada-web-components.git"
+  },
+  "bugs": {
+    "url": "https://github.com/inscada-app/inscada-web-components/issues"
+  },
+  "homepage": "https://github.com/inscada-app/inscada-web-components#readme"
 }
