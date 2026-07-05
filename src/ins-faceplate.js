@@ -1,348 +1,635 @@
 /**
- * <ins-faceplate> — Render an inSCADA Faceplate as a Web Component.
+ * <ins-faceplate> v2 — iframe-first faceplate renderer for inSCADA Custom HTML.
  *
- * Loads a faceplate (SVG + animation elements + placeholders) from the
- * inSCADA REST API via the Transport layer, substitutes placeholder values
- * from attributes, evaluates element expressions periodically, and renders
- * live SVG with animated bindings.
+ * v2 design decisions (2026-07-05):
+ * - **Inline metadata.** Faceplate elements + placeholders come with the tag
+ *   (`metadata` attribute JSON, or a `<script type="application/json">` child).
+ *   No runtime `/api/faceplates/*` fetch — those endpoints are blocked on the
+ *   sandbox port by `SandboxPortSecurityFilter`. Callers (typically an LLM
+ *   using the Cloud MCP faceplate tools) fetch metadata at design time and
+ *   embed concrete JSON.
+ * - **SVG via sandbox-safe assets.** Path resolves under
+ *   `/api/custom-html/assets/<svg-path>` — the only file route allowed inside
+ *   the Custom HTML iframe.
+ * - **Client-side expression eval.** Expressions run in a `new Function()`
+ *   with an `ins` shim that reads a poll cache. The backend script runner is
+ *   blocked in the sandbox and — more importantly — is unnecessary here: the
+ *   expressions inSCADA generates are Nashorn ES5 which the browser also
+ *   understands. `ins.getVariableValue(name)` is fed from a batched
+ *   `api.getVariableValues([...])` proxy call refreshed every `poll` ms.
+ * - **Metadata is snake_case.** Matches the MCP tool output verbatim so the
+ *   LLM can paste it in without renames (`dom_id`, `expression_type`, etc.).
  *
- * Usage (JDK21 — project = project NAME, string):
+ * Preserved from v1:
+ *   Shadow DOM isolation, attribute → placeholder value collection,
+ *   9-type element handlers (Get/Color/Opacity/Visibility/Rotate/Bar/Blink/
+ *   Move/Scale), Color blink split (`c1/c2`).
+ *
+ * Deferred to a later revision:
+ *   Nested Faceplate rendering, `client_api:true` types (Chart / Datatable /
+ *   Slider / Peity), API-mode metadata fetch (needs a sandbox-allowed
+ *   `/api/faceplates/{id}/render` endpoint).
+ *
+ * Usage:
  *   <ins-faceplate
- *     project="AYBIGE_HES"
- *     name="Motor_Standard"
- *     duration="2000"
- *     motor_name="Motor 1"
- *     speed_var="M1_Speed"
- *     status_var="M1_Status">
+ *     svg-path="faceplates/H01_FeederTemplate.svg"
+ *     project="PALANDOKEN_GES"
+ *     brand="Siemens 7SJ82"
+ *     cb_status="CB01_STATUS"
+ *     poll="2000">
+ *     <script type="application/json">
+ *       {
+ *         "placeholders": [
+ *           {"name":"brand","type":"text"},
+ *           {"name":"cb_status","type":"tag"}
+ *         ],
+ *         "elements": [
+ *           {"dom_id":"label","type":"Get","expression_type":"EXPRESSION",
+ *            "expression":"return '$brand$';","props":"{}"},
+ *           {"dom_id":"cb_body","type":"Color","expression_type":"EXPRESSION",
+ *            "expression":"return ins.getVariableValue('$cb_status$').value ? '#0c0' : '#c00';",
+ *            "props":"{\"property\":\"fill\"}"}
+ *         ]
+ *       }
+ *     </script>
  *   </ins-faceplate>
- *
- * Attributes:
- *   project   — Project NAME (required, JDK21)
- *   name      — Faceplate name (required)
- *   duration  — Refresh interval in ms (default: 2000)
- *   width     — SVG width (default: 100%)
- *   height    — SVG height (default: auto)
- *   Any other attribute is treated as a placeholder value ($name$ substitution).
  */
 
-import { getTransport } from './transport/index.js';
+import { getTransport, ASSET_READER_CODE } from './transport/index.js';
 
 const RESERVED_ATTRS = new Set([
-  'project', 'name', 'duration', 'width', 'height', 'style', 'class', 'id',
-  // Kept for backward-compat with v0.x examples; ignored as placeholders.
-  'space',
+  'svg-path', 'svg-content', 'metadata', 'project', 'poll',
+  'width', 'height', 'style', 'class', 'id', 'debug',
 ]);
+
+const DEFAULT_POLL_MS = 2000;
+const MIN_POLL_MS = 200;
+const BLINK_MS = 500;
 
 export default class InsFaceplate extends HTMLElement {
   constructor() {
     super();
-    this.attachShadow({ mode: 'open' });
-    this._faceplate = null;
-    this._projectId = null;
-    this._elements = [];
-    this._placeholders = {};
+    // Deliberately NO Shadow DOM (browser quirks around <object> in shadow).
+    // Also NO string-eval anywhere — the sandbox iframe's CSP forbids
+    // `unsafe-eval`, so `new Function(body)` throws. Callers instead ship
+    // pre-written resolver functions keyed by dom_id via setResolvers().
+    this._api = null;
+    this._svgRoot = null;
+    this._svgObject = null;
+    this._elementDefs = [];
+    this._placeholderDefs = [];
+    this._placeholders = {};       // { brand: 'Siemens 7SJ82', ... } — keyed by RAW attr name (not $wrapped$)
+    this._resolvers = {};          // { dom_id: (ins, ph) => value }
+    this._tagsToPoll = [];
+    this._cache = {};              // { varName: { value, date, ... } }
     this._timer = null;
-    this._loaded = false;
+    this._observer = null;
+    this._debug = false;
+    this._metadataCache = null;
+    this._inlineSvgCache = null;
   }
 
-  static get observedAttributes() {
-    return ['project', 'name', 'duration'];
-  }
+  // We handle every attribute change through a MutationObserver so runtime
+  // updates from user code — `fp.setAttribute('brand', 'ABB REF615')` — flow
+  // through re-substitute + re-compile + tick without requiring the caller
+  // to enumerate every placeholder up-front.
+  static get observedAttributes() { return []; }
 
-  connectedCallback() {
-    this._render();
-    this._load();
+  async connectedCallback() {
+    this._debug = this.hasAttribute('debug');
+    // Yield to the HTML parser so light-DOM children (metadata <script>,
+    // inline <template>) have a chance to be inserted. connectedCallback
+    // fires when the element is inserted, which for the parser path is
+    // BEFORE its children are parsed — reading them here returns null.
+    // A single macrotask boundary is enough for a straight-line subtree.
+    if (this.childNodes.length === 0 && document.readyState === 'loading') {
+      await new Promise(function (r) { setTimeout(r, 0); });
+    }
+    // Read metadata + optional inline SVG BEFORE we wipe children in
+    // _renderShell().
+    this._metadataCache = this._readMetadataFromDom();
+    this._inlineSvgCache = this._readInlineSvgFromDom();
+    this._renderShell();
+    this._observeAttrs();
+    await this._init();
   }
 
   disconnectedCallback() {
     this._stopPolling();
+    this._clearBlinks();
+    if (this._observer) { this._observer.disconnect(); this._observer = null; }
+    // Detach the <object> so pending network for it dies with us.
+    if (this._svgObject && this._svgObject.parentNode) {
+      this._svgObject.parentNode.removeChild(this._svgObject);
+    }
+    this._svgObject = null;
+    this._svgRoot = null;
   }
 
-  attributeChangedCallback(attr, oldVal, newVal) {
-    if (oldVal !== newVal && this._loaded) {
-      this._load();
+  _observeAttrs() {
+    if (this._observer) return;
+    const self = this;
+    this._observer = new MutationObserver(function (mutations) { self._onAttrChange(mutations); });
+    this._observer.observe(this, { attributes: true });
+  }
+
+  _onAttrChange(mutations) {
+    if (!this._svgRoot && !this._svgObject) return;
+    const structural = ['svg-path', 'svg-content', 'metadata', 'project'];
+    let restart = false, pollChanged = false, phChanged = false;
+    for (const m of mutations) {
+      const n = String(m.attributeName || '').toLowerCase();
+      if (!n) continue;
+      if (structural.indexOf(n) !== -1) { restart = true; break; }
+      if (n === 'poll') pollChanged = true;
+      else if (!RESERVED_ATTRS.has(n)) phChanged = true;
+    }
+    if (restart) { this._init(); return; }
+    if (pollChanged && this._timer) this._startPolling();
+    if (phChanged) {
+      this._placeholders = this._collectPlaceholderValues();
+      this._deriveTagsToPoll();
+      if (this._tagsToPoll.length === 0) this._tick();
+      else if (!this._timer) this._startPolling();
     }
   }
 
-  get project() { return this.getAttribute('project'); }
-  get faceplateName() { return this.getAttribute('name'); }
-  get duration() { return parseInt(this.getAttribute('duration') || '2000', 10); }
+  /* ── shell / errors ──────────────────────────────────────────── */
 
-  /** Collect non-reserved attributes as placeholder values */
-  _getPlaceholderValues() {
-    const values = {};
-    for (const attr of this.attributes) {
-      if (!RESERVED_ATTRS.has(attr.name.toLowerCase())) {
-        values[attr.name] = attr.value;
+  _renderShell() {
+    // Preserve caller-supplied inline styles; only fill missing.
+    if (!this.style.display) this.style.display = 'inline-block';
+    if (!this.style.width && this.getAttribute('width')) this.style.width = this.getAttribute('width');
+    if (!this.style.height && this.getAttribute('height')) this.style.height = this.getAttribute('height');
+    // Light-DOM markup — replaces any children (including the metadata
+    // <script>), which is safe because we cache metadata before this runs.
+    this.innerHTML =
+      '<div class="ins-fp-wrap" style="width:100%;height:100%;position:relative;">' +
+        '<div class="ins-fp-msg" style="font-family:sans-serif;font-size:12px;padding:6px;color:#888;">Loading faceplate…</div>' +
+      '</div>';
+  }
+
+  _err(msg) {
+    const wrap = this.querySelector('.ins-fp-wrap');
+    if (wrap) wrap.innerHTML = '<div class="ins-fp-msg" style="font-family:sans-serif;font-size:12px;padding:6px;color:#c00;">' + this._esc(msg) + '</div>';
+    if (this._debug) console.error('[ins-faceplate]', msg);
+  }
+
+  _esc(s) {
+    return String(s).replace(/[&<>]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c];
+    });
+  }
+
+  /* ── init pipeline ───────────────────────────────────────────── */
+
+  async _init() {
+    this._stopPolling();
+    this._clearBlinks();
+    if (this._svgObject && this._svgObject.parentNode) {
+      this._svgObject.parentNode.removeChild(this._svgObject);
+    }
+    this._svgObject = null;
+    this._svgRoot = null;
+
+    const meta = this._readMetadata();
+    if (!meta) {
+      return this._err('Missing metadata. Provide it as a `metadata` attribute (JSON string) or a `<script type="application/json">` child.');
+    }
+    this._placeholderDefs = Array.isArray(meta.placeholders) ? meta.placeholders : [];
+    this._elementDefs = Array.isArray(meta.elements) ? meta.elements : [];
+
+    try {
+      await this._loadSvg();
+      if (!this._svgRoot) return this._err('SVG source produced no <svg> root element.');
+    } catch (e) {
+      return this._err('SVG load failed: ' + (e && e.message || e));
+    }
+
+    this._placeholders = this._collectPlaceholderValues();
+    this._api = this._resolveApi();
+    this._deriveTagsToPoll();
+
+    if (this._tagsToPoll.length > 0 && !this._api) {
+      if (this._debug) {
+        console.warn(
+          '[ins-faceplate] window.InscadaApi not found; live tag values will ' +
+          'be null until the InscadaApi proxy is available.'
+        );
       }
     }
-    return values;
+
+    if (this._tagsToPoll.length === 0) {
+      this._tick();
+    } else {
+      this._startPolling();
+    }
   }
 
-  /** Initial loading state */
-  _render() {
-    const w = this.getAttribute('width') || '100%';
-    const h = this.getAttribute('height') || 'auto';
-    this.shadowRoot.innerHTML = `
-      <style>
-        :host { display: inline-block; width: ${w}; height: ${h}; }
-        .container { width: 100%; height: 100%; position: relative; }
-        .container svg { width: 100%; height: 100%; }
-        .loading { color: #888; font-size: 12px; text-align: center; padding: 20px; font-family: sans-serif; }
-        .error { color: #c00; font-size: 12px; text-align: center; padding: 10px; font-family: sans-serif; }
-      </style>
-      <div class="container">
-        <div class="loading">Loading faceplate...</div>
-      </div>
-    `;
+  // In-init lookup: prefer a live `metadata` attribute (may have changed),
+  // else fall back to the cached copy captured from the light-DOM child at
+  // connect time.
+  _readMetadata() {
+    const attr = this.getAttribute('metadata');
+    if (attr && attr.trim().length > 0) {
+      try { return JSON.parse(attr); }
+      catch (e) { this._err('metadata attribute JSON parse error: ' + e.message); return null; }
+    }
+    return this._metadataCache;
   }
 
-  /** Load faceplate via Transport (handles same-origin / proxy auto-detect) */
-  async _load() {
-    const projectName = this.project;
-    const fpName = this.faceplateName;
-    if (!projectName || !fpName) {
-      this._showError('Missing project or name attribute');
+  // Reads a light-DOM `<template>` child once (before _renderShell wipes it)
+  // and returns its innerHTML — expected to contain a full <svg>…</svg>
+  // element. This is the CSP-safe alternative to `svg-path` for iframe-hosted
+  // Custom HTML: backend serves the SVG asset with a `frame-ancestors` CSP
+  // that excludes the sandbox port, so `<object data="…">` framing is
+  // blocked at load time. Embedding the SVG in the light DOM sidesteps that
+  // entirely — parsed as HTML, no framing, no CSP.
+  _readInlineSvgFromDom() {
+    const t = this.querySelector('template.ins-fp-svg') ||
+              this.querySelector('template[data-role="svg"]') ||
+              this.querySelector('template');
+    if (t && t.innerHTML && t.innerHTML.trim().length > 0) return t.innerHTML;
+    return null;
+  }
+
+  // Reads the light-DOM `<script type="application/json">` child once, before
+  // _renderShell() replaces the children. Returns null if neither the attr
+  // nor a child script is present.
+  _readMetadataFromDom() {
+    const attr = this.getAttribute('metadata');
+    if (attr && attr.trim().length > 0) {
+      try { return JSON.parse(attr); }
+      catch (e) { this._err('metadata attribute JSON parse error: ' + e.message); return null; }
+    }
+    const script = this.querySelector('script[type="application/json"]');
+    if (script && script.textContent.trim().length > 0) {
+      try { return JSON.parse(script.textContent); }
+      catch (e) { this._err('metadata <script> JSON parse error: ' + e.message); return null; }
+    }
+    return null;
+  }
+
+  /**
+   * Load the SVG source and inject it as inline DOM under `.ins-fp-wrap`.
+   *
+   * Three sources, in priority order:
+   *   1. `svg-content` attribute (inline literal string).
+   *   2. Cached inline SVG from a `<template class="ins-fp-svg">` child.
+   *   3. `svg-path` — asset relative to the space file store (e.g.
+   *      `faceplates/H01.svg`). Resolves via `transport.loadPublishedFile`.
+   *
+   * Why not `<object data="/api/custom-html/assets/…">` (the pre-v2 approach):
+   * the Custom HTML iframe's CSP `frame-ancestors 'self' <mainOrigin>` does
+   * NOT include the sandbox port, so `<object>` framing is browser-blocked
+   * even for same-origin allowlisted assets. `<img>` renders but has no JS
+   * access to the SVG DOM tree.
+   *
+   * Why not `api.readPublishedFile(path)` directly: it exists on newer builds
+   * but crashes on the parent SPA's unconditional JSON.parse (Spring writes
+   * String returns as raw text). See tools/BUG_scripts_callapi_raw_string_response.md.
+   *
+   * The transport encapsulates the workaround (asset_reader server-side
+   * script wraps the string in a Map so Jackson JSON-encodes it). When
+   * Muhammed's fix lands, only the transport method changes — the component
+   * doesn't care.
+   */
+  async _loadSvg() {
+    const wrap = this.querySelector('.ins-fp-wrap');
+
+    const inline = this.getAttribute('svg-content') || this._inlineSvgCache;
+    if (inline) {
+      this._injectSvgString(wrap, inline);
       return;
     }
 
-    try {
-      const transport = getTransport();
-      const { def, projectId, svg, elements, placeholders } =
-        await transport.loadFaceplate(projectName, fpName);
+    const path = this.getAttribute('svg-path');
+    if (!path) throw new Error('svg-path or svg-content attribute required');
 
-      this._faceplate = def;
-      this._projectId = projectId;
-      this._elements = elements || [];
-      this._placeholderDefs = placeholders || [];
-      this._placeholders = this._getPlaceholderValues();
+    const project = this.getAttribute('project');
+    const svgString = await getTransport().loadPublishedFile(project, path);
+    this._injectSvgString(wrap, svgString);
+  }
 
-      this._renderSvg(svg);
-      this._loaded = true;
-      this._startPolling();
-    } catch (err) {
-      this._showError('Failed to load faceplate: ' + (err?.message || err));
+  _injectSvgString(wrap, svgString) {
+    wrap.innerHTML = svgString;
+    const root = wrap.querySelector('svg');
+    if (!root) throw new Error('Loaded content has no <svg> root element.');
+    root.style.width = '100%';
+    root.style.height = '100%';
+    root.style.display = 'block';
+    this._svgRoot = root;
+  }
+
+  /**
+   * All non-reserved attributes become placeholder values, keyed by RAW
+   * attribute name (e.g. `ph.brand`, not `ph['$brand$']`). This is what
+   * resolver functions consume — `function(ins, ph) { return ph.brand; }`.
+   */
+  _collectPlaceholderValues() {
+    const out = {};
+    for (const attr of Array.from(this.attributes)) {
+      const name = attr.name.toLowerCase();
+      if (RESERVED_ATTRS.has(name)) continue;
+      out[name] = attr.value;
+    }
+    return out;
+  }
+
+  _resolveApi() {
+    if (typeof window === 'undefined' || typeof window.InscadaApi !== 'function') return null;
+    const project = this.getAttribute('project') || 'default';
+    try { return new window.InscadaApi(project); }
+    catch (e) { if (this._debug) console.warn('[ins-faceplate] InscadaApi construct failed', e); return null; }
+  }
+
+  /**
+   * Register per-element resolver functions. Called by page code — the
+   * component itself performs no string-to-function compilation, so it's
+   * CSP-safe even under `script-src` without `unsafe-eval`.
+   *
+   * Example:
+   *   fp.setResolvers({
+   *     'text4-8': function(ins, ph) { return ph.brand; },
+   *     'cb_body': function(ins, ph) {
+   *       return ins.getVariableValue(ph.cb_status).value ? '#0c0' : '#c00';
+   *     }
+   *   });
+   *
+   * `ph` is the placeholder map keyed by raw attribute name; `ins` is a
+   * proxy that reads from the last poll's cache (see _insShim).
+   */
+  setResolvers(map) {
+    this._resolvers = (map && typeof map === 'object') ? map : {};
+    this._deriveTagsToPoll();
+    if (this._svgRoot) {
+      if (this._tagsToPoll.length === 0) this._tick();
+      else if (!this._timer) this._startPolling();
     }
   }
 
-  /** Render the faceplate SVG into shadow DOM */
-  _renderSvg(svgContent) {
-    const w = this.getAttribute('width') || '100%';
-    const h = this.getAttribute('height') || 'auto';
-    const container = this.shadowRoot.querySelector('.container');
-    if (!container) return;
-
-    container.innerHTML = svgContent;
-
-    const svg = container.querySelector('svg');
-    if (svg) {
-      if (w !== 'auto') svg.style.width = w;
-      if (h !== 'auto') svg.style.height = h;
+  // Union of (a) tag-type placeholder attribute values and (b) explicitly
+  // declared extra tags from an optional `poll-tags` attribute (comma-
+  // separated). Resolvers can reference variables the metadata doesn't
+  // enumerate; poll-tags is the escape hatch for those.
+  _deriveTagsToPoll() {
+    const tags = new Set();
+    for (const p of this._placeholderDefs) {
+      if (!p) continue;
+      if (String(p.type || '').toLowerCase() !== 'tag') continue;
+      const key = this._unwrap(p.name || '').toLowerCase();
+      const val = this._placeholders[key];
+      if (val) tags.add(val);
     }
+    const extra = this.getAttribute('poll-tags');
+    if (extra) {
+      const parts = String(extra).split(',');
+      for (const raw of parts) { const t = raw.trim(); if (t) tags.add(t); }
+    }
+    this._tagsToPoll = Array.from(tags);
   }
 
-  /** Substitute placeholders in expression: $name$ → value */
-  _substituteExpression(expression) {
-    let result = expression;
-    for (const [key, value] of Object.entries(this._placeholders)) {
-      const pattern = new RegExp('\\$' + key + '\\$', 'g');
-      result = result.replace(pattern, value);
+  _unwrap(name) {
+    if (typeof name !== 'string') return name;
+    if (name.length >= 2 && name.charAt(0) === '$' && name.charAt(name.length - 1) === '$') {
+      return name.slice(1, -1);
     }
-    return result;
+    return name;
   }
 
-  /** Evaluate all element expressions in a single ad-hoc script call */
-  async _evaluate() {
-    if (!this._faceplate || this._elements.length === 0) return;
+  /* ── polling & eval loop ────────────────────────────────────── */
 
-    const textElems = [];
-    const exprElems = [];
+  _startPolling() {
+    this._stopPolling();
+    const p = parseInt(this.getAttribute('poll') || DEFAULT_POLL_MS, 10);
+    const interval = Math.max(MIN_POLL_MS, isNaN(p) ? DEFAULT_POLL_MS : p);
+    this._tick();
+    const self = this;
+    this._timer = setInterval(function () { self._tick(); }, interval);
+  }
 
-    for (const elem of this._elements) {
-      const substituted = this._substituteExpression(elem.expression);
-      if (elem.expressionType === 'TEXT') {
-        textElems.push({ elem, value: substituted });
-      } else {
-        exprElems.push({ elem, expression: substituted });
-      }
-    }
+  _stopPolling() {
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+  }
 
-    // Apply TEXT values immediately (no backend call)
-    for (const { elem, value } of textElems) this._applyValue(elem, value);
-
-    if (exprElems.length === 0) return;
-
-    // Build a single script that evaluates all expressions and returns JSON
-    const parts = exprElems.map(({ elem, expression }) => {
-      let code = expression.trim();
-      if (!code.includes('return ')) code = 'return ' + code;
-      return `try { __r["${elem.domId}"] = (function(){ ${code} })(); } catch(e) { __r["${elem.domId}"] = null; }`;
-    });
-    const batchCode = `var __r = {};\n${parts.join('\n')}\nins.toJSONStr(__r);`;
-
-    try {
-      const transport = getTransport();
-      const resultText = await transport.runAdHocScript({
-        projectId: this._projectId,
-        name: 'faceplate_batch',
-        code: batchCode,
-        log: false,
-        compile: false,
-      });
-
-      let results;
+  async _tick() {
+    if (this._tagsToPoll.length > 0 && this._api) {
       try {
-        results = typeof resultText === 'string' ? JSON.parse(resultText) : resultText;
-      } catch {
-        return; // malformed; skip this tick
+        const result = await this._api.getVariableValues(this._tagsToPoll);
+        this._cache = (result && typeof result === 'object') ? result : {};
+      } catch (e) {
+        if (this._debug) console.warn('[ins-faceplate] getVariableValues failed', e);
       }
-
-      for (const { elem } of exprElems) {
-        if (results && elem.domId in results && results[elem.domId] !== null) {
-          this._applyValue(elem, String(results[elem.domId]));
-        }
+    }
+    const ins = this._insShim();
+    const ph = this._placeholders;
+    for (const def of this._elementDefs) {
+      if (!def || !def.dom_id) continue;
+      const resolver = this._resolvers[def.dom_id];
+      if (typeof resolver !== 'function') {
+        if (this._debug) console.warn('[ins-faceplate] no resolver registered for dom_id', def.dom_id);
+        continue;
       }
-    } catch (_) {
-      // Silently skip batch evaluation errors; next tick retries
+      let value;
+      try { value = resolver.call(null, ins, ph); }
+      catch (e) {
+        if (this._debug) console.warn('[ins-faceplate] resolver threw for', def.dom_id, e);
+        continue;
+      }
+      this._apply(def, value);
     }
   }
 
-  /** Apply evaluated value to SVG element based on animation type */
-  _applyValue(elem, rawValue) {
-    const el = this.shadowRoot.querySelector(`#${elem.domId}`) ||
-               this.shadowRoot.querySelector(`[id="${elem.domId}"]`);
-    if (!el) return;
+  _insShim() {
+    const cache = this._cache;
+    return {
+      getVariableValue: function (name) { return cache[name] || { value: null, date: null }; },
+      getVariableValues: function (names) {
+        const out = {};
+        for (const n of names) out[n] = cache[n] || { value: null, date: null };
+        return out;
+      },
+      toJSONStr: function (o) { return JSON.stringify(o); },
+      // No-op stubs so server-only calls in expressions don't throw. If a
+      // faceplate relies on writes / logs / alarms from an expression, that
+      // is a server-side script pattern and doesn't belong in a widget anyway.
+      setVariableValue: function () {},
+      log: function () {},
+    };
+  }
 
-    let cleaned = rawValue;
-    if (typeof cleaned === 'string') {
-      cleaned = cleaned.trim();
-      if ((cleaned.startsWith('"') && cleaned.endsWith('"')) ||
-          (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
-        cleaned = cleaned.slice(1, -1);
+  /* ── apply value to SVG ─────────────────────────────────────── */
+
+  _apply(def, rawValue) {
+    if (!this._svgRoot) return;
+    const svgEl = this._findSvgEl(def.dom_id);
+    if (!svgEl) {
+      if (this._debug) console.warn('[ins-faceplate] SVG element not found for dom_id', def.dom_id);
+      return;
+    }
+
+    // Strip accidental outer quotes coming back as a string.
+    let value = rawValue;
+    if (typeof value === 'string') {
+      value = value.trim();
+      if ((value.charAt(0) === '"' && value.charAt(value.length - 1) === '"') ||
+          (value.charAt(0) === "'" && value.charAt(value.length - 1) === "'")) {
+        value = value.slice(1, -1);
       }
     }
 
-    let value;
-    try { value = JSON.parse(cleaned); } catch { value = cleaned; }
+    const props = this._parseProps(def.props);
 
-    switch (elem.type) {
-      case 'Get':
-        el.textContent = value != null ? String(value) : '';
+    switch (def.type) {
+      case 'Get': {
+        // Preserve <text><tspan>…</tspan></text> structure — SCADA convention.
+        // Overwriting `textContent` on the <text> wipes the tspan; write to
+        // the tspan when present so styling/positioning is retained.
+        const tspan = svgEl.querySelector('tspan');
+        const target = tspan || svgEl;
+        target.textContent = value != null ? String(value) : '';
         break;
+      }
 
-      case 'Color':
-        if (typeof value === 'string') {
-          if (value.includes('/')) {
-            const [c1, c2] = value.split('/');
-            el.style.fill = c1;
-            if (!el._blinkInterval) {
-              let toggle = false;
-              el._blinkInterval = setInterval(() => {
-                el.style.fill = toggle ? c1 : c2;
-                toggle = !toggle;
-              }, 500);
-            }
-          } else {
-            if (el._blinkInterval) { clearInterval(el._blinkInterval); el._blinkInterval = null; }
-            el.style.fill = value;
+      case 'Color': {
+        if (typeof value !== 'string') break;
+        const property = props.property || 'fill';
+        if (value.indexOf('/') !== -1) {
+          const parts = value.split('/');
+          const c1 = parts[0], c2 = parts[1];
+          svgEl.style[property] = c1;
+          if (!svgEl._blinkInterval) {
+            let toggle = false;
+            svgEl._blinkInterval = setInterval(function () {
+              svgEl.style[property] = toggle ? c1 : c2;
+              toggle = !toggle;
+            }, BLINK_MS);
           }
+        } else {
+          this._clearBlink(svgEl);
+          svgEl.style[property] = value;
         }
         break;
+      }
 
-      case 'Opacity':
-        el.style.opacity = parseFloat(value) || 1;
+      case 'Opacity': {
+        const o = parseFloat(value);
+        svgEl.style.opacity = isNaN(o) ? 1 : o;
         break;
+      }
 
-      case 'Visibility':
-        el.style.display = value ? '' : 'none';
+      case 'Visibility': {
+        const on = value === true || value === 'true' || value === 1 || value === '1';
+        svgEl.style.display = on ? '' : 'none';
         break;
+      }
 
       case 'Rotate': {
         const angle = parseFloat(value) || 0;
-        const props = JSON.parse(elem.props || '{}');
-        const cx = props.cx || 0;
-        const cy = props.cy || 0;
-        el.setAttribute('transform', `rotate(${angle}, ${cx}, ${cy})`);
+        const cx = props.cx != null ? props.cx : 0;
+        const cy = props.cy != null ? props.cy : 0;
+        svgEl.setAttribute('transform', 'rotate(' + angle + ',' + cx + ',' + cy + ')');
         break;
       }
 
       case 'Bar': {
         const numVal = parseFloat(value) || 0;
-        const props = JSON.parse(elem.props || '{}');
-        const min = props.min || 0;
-        const max = props.max || 100;
-        const ratio = Math.max(0, Math.min(1, (numVal - min) / (max - min)));
+        const min = props.min != null ? props.min : 0;
+        const max = props.max != null ? props.max : 100;
         const orientation = props.orientation || 'Bottom';
+        const denom = (max - min) || 1;
+        const ratio = Math.max(0, Math.min(1, (numVal - min) / denom));
 
         if (orientation === 'Right' || orientation === 'Left') {
-          const origW = parseFloat(el.getAttribute('width')) || 100;
-          el.setAttribute('width', origW * ratio);
+          if (!svgEl.getAttribute('data-orig-width')) {
+            svgEl.setAttribute('data-orig-width', svgEl.getAttribute('width') || '100');
+          }
+          const origW = parseFloat(svgEl.getAttribute('data-orig-width')) || 100;
+          svgEl.setAttribute('width', origW * ratio);
         } else {
-          const origH = parseFloat(el.getAttribute('height')) || 100;
+          if (!svgEl.getAttribute('data-orig-height')) {
+            svgEl.setAttribute('data-orig-height', svgEl.getAttribute('height') || '100');
+          }
+          if (!svgEl.getAttribute('data-orig-y')) {
+            svgEl.setAttribute('data-orig-y', svgEl.getAttribute('y') || '0');
+          }
+          const origH = parseFloat(svgEl.getAttribute('data-orig-height')) || 100;
+          const origY = parseFloat(svgEl.getAttribute('data-orig-y')) || 0;
           const newH = origH * ratio;
-          el.setAttribute('height', newH);
+          svgEl.setAttribute('height', newH);
           if (orientation === 'Bottom') {
-            const origY = parseFloat(el.getAttribute('data-orig-y') || el.getAttribute('y')) || 0;
-            if (!el.getAttribute('data-orig-y')) el.setAttribute('data-orig-y', el.getAttribute('y'));
-            el.setAttribute('y', origY + origH - newH);
+            svgEl.setAttribute('y', origY + origH - newH);
           }
         }
         break;
       }
 
-      case 'Blink':
-        if (value === true || value === 'true') {
-          if (!el._blinkInterval) {
-            el._blinkInterval = setInterval(() => {
-              el.style.visibility = el.style.visibility === 'hidden' ? 'visible' : 'hidden';
+      case 'Blink': {
+        const on = value === true || value === 'true' || value === 1 || value === '1';
+        if (on) {
+          if (!svgEl._blinkInterval) {
+            svgEl._blinkInterval = setInterval(function () {
+              svgEl.style.visibility = svgEl.style.visibility === 'hidden' ? 'visible' : 'hidden';
             }, 300);
           }
         } else {
-          if (el._blinkInterval) { clearInterval(el._blinkInterval); el._blinkInterval = null; }
-          el.style.visibility = 'visible';
+          this._clearBlink(svgEl);
+          svgEl.style.visibility = 'visible';
         }
         break;
+      }
 
       case 'Move': {
         const pos = parseFloat(value) || 0;
-        el.setAttribute('transform', `translate(${pos}, 0)`);
+        const axis = String(props.orientation || 'X').toUpperCase();
+        svgEl.setAttribute('transform', axis === 'Y' ? ('translate(0,' + pos + ')') : ('translate(' + pos + ',0)'));
         break;
       }
 
       case 'Scale': {
-        const scale = parseFloat(value) || 1;
-        el.setAttribute('transform', `scale(${scale})`);
+        const s = parseFloat(value) || 1;
+        svgEl.setAttribute('transform', 'scale(' + s + ')');
         break;
       }
 
       default:
-        if (value != null) el.textContent = String(value);
-        break;
+        if (this._debug) console.warn('[ins-faceplate] unhandled element type', def.type, def.dom_id);
     }
   }
 
-  _startPolling() {
-    this._stopPolling();
-    this._evaluate();
-    this._timer = setInterval(() => this._evaluate(), this.duration);
+  _findSvgEl(domId) {
+    if (!this._svgRoot || !domId) return null;
+    // CSS.escape not available in every polyfill target — fall back to
+    // `[id="…"]` which handles anything the CSS selector can't.
+    try {
+      const q = this._svgRoot.querySelector('#' + (window.CSS && window.CSS.escape ? window.CSS.escape(domId) : domId));
+      if (q) return q;
+    } catch (_) { /* invalid selector */ }
+    return this._svgRoot.querySelector('[id="' + String(domId).replace(/"/g, '\\"') + '"]');
   }
 
-  _stopPolling() {
-    if (this._timer) {
-      clearInterval(this._timer);
-      this._timer = null;
-    }
-    if (this.shadowRoot) {
-      this.shadowRoot.querySelectorAll('*').forEach(el => {
-        if (el._blinkInterval) { clearInterval(el._blinkInterval); el._blinkInterval = null; }
-      });
+  _parseProps(props) {
+    if (!props) return {};
+    if (typeof props === 'object') return props;
+    try { return JSON.parse(props); } catch (_) { return {}; }
+  }
+
+  _clearBlink(el) {
+    if (el && el._blinkInterval) {
+      clearInterval(el._blinkInterval);
+      el._blinkInterval = null;
     }
   }
 
-  _showError(msg) {
-    const container = this.shadowRoot.querySelector('.container');
-    if (container) {
-      container.innerHTML = `<div class="error">${msg}</div>`;
-    }
+  _clearBlinks() {
+    if (!this._svgRoot) return;
+    const all = this._svgRoot.querySelectorAll('*');
+    for (const el of all) this._clearBlink(el);
   }
 }
+
+// Re-export the source of the server-side 'asset_reader' script so callers
+// can console.log(InsFaceplate.ASSET_READER_CODE) and paste it into a new
+// Repeatable Script in their inSCADA project. Iframe mode's svg-path loading
+// depends on this script existing; standalone mode does not.
+InsFaceplate.ASSET_READER_CODE = ASSET_READER_CODE;

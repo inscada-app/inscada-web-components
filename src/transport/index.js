@@ -158,6 +158,63 @@ class Transport {
   }
 
   /**
+   * Load a published file's content as a UTF-8 string.
+   *
+   *   iframe mode → uses the `asset_reader` server-side script pattern.
+   *     The script must exist in the target project; see
+   *     `ASSET_READER_CODE` below for the source. Two round-trips:
+   *       1) setGlobalObject('reader_path', path)
+   *       2) executeScript('asset_reader')
+   *     Returns { path, content, bytes } — we extract .content.
+   *
+   *     Why not `api.readPublishedFile(path)` directly: it exists (build
+   *     ≥ 2026-06-15) but the parent SPA's InscadaApi.call() unconditionally
+   *     JSON.parses the response, and Spring writes String returns as raw
+   *     text — parse crashes. See tools/BUG_scripts_callapi_raw_string_response.md.
+   *     asset_reader wraps the string in a Map so Jackson JSON-encodes it.
+   *
+   *   standalone mode → direct fetch of `/api/custom-html/assets/<path>`
+   *     with credentials. Same-origin so CORS is fine.
+   *
+   * Errors:
+   *   - 'Missing asset_reader script in project X' — user must create it once
+   *     per project via MCP or platform UI. Component surfaces
+   *     `InsFaceplate.ASSET_READER_CODE` for copy-paste.
+   */
+  async loadPublishedFile(projectName, path) {
+    if (!path) throw new Error('path is required');
+    if (this._isIframeWithProxy) {
+      if (!projectName) throw new Error('projectName is required in iframe mode');
+      const api = this._getApi(projectName);
+      await api.setGlobalObject('reader_path', path);
+      let res;
+      try {
+        res = await api.executeScript('asset_reader');
+      } catch (e) {
+        const msg = String(e && e.message || e);
+        if (msg.indexOf('Repeatable script not found') >= 0 || msg.indexOf('asset_reader') >= 0) {
+          throw new Error(
+            "Missing 'asset_reader' script in project '" + projectName + "'. " +
+            "Create it once (server-side script named exactly 'asset_reader') " +
+            'with this code: `Transport.ASSET_READER_CODE`.'
+          );
+        }
+        throw e;
+      }
+      if (!res || typeof res !== 'object') {
+        throw new Error("asset_reader returned unexpected shape: " + JSON.stringify(res));
+      }
+      if (res.error) throw new Error("asset_reader error: " + res.error);
+      if (typeof res.content !== 'string') {
+        throw new Error("asset_reader returned no content for '" + path + "'");
+      }
+      return res.content;
+    }
+    const url = this._baseUrl + '/api/custom-html/assets/' + path.replace(/^\/+/, '');
+    return this._sameOriginText(url);
+  }
+
+  /**
    * External URL fetch (cross-origin). In iframe mode this MUST go through
    * the InscadaApi proxy (CSP blocks direct cross-origin fetch + ins.rest
    * server-side allowlist applies). In standalone mode it's a direct fetch
@@ -215,6 +272,21 @@ class Transport {
     return this._apiCache.get(projectName);
   }
 }
+
+/**
+ * The exact source code of the server-side script named `asset_reader`.
+ * Copy this into a new Repeatable Script in the target project.
+ *
+ * Nashorn ES5 syntax (JDK21 default). Wraps the raw String from ins.readFile
+ * in an Object so Jackson serializes it as JSON — bypasses the
+ * StringHttpMessageConverter raw-text bug that crashes InscadaApi.call().
+ */
+export const ASSET_READER_CODE = "(function () {\n" +
+  "  var path = ins.getGlobalObject('reader_path');\n" +
+  "  if (path == null) return { error: 'reader_path global not set' };\n" +
+  "  var content = ins.readFile(path);\n" +
+  "  return { path: path, content: content, bytes: content == null ? 0 : content.length };\n" +
+  "})();\n";
 
 function _detectProxyMode() {
   try {
