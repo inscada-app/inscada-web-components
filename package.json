@@ -1,7 +1,7 @@
 {
   "name": "@inscada/web-components",
-  "version": "1.0.0-beta.2",
-  "description": "inSCADA Web Components (JDK21) — Transport-abstracted live values, faceplates, REST fetch. Auto-detects iframe (InscadaApi proxy) vs same-origin standalone.",
+  "version": "2.0.0-alpha.2",
+  "description": "inSCADA Web Components (JDK21) — live values, faceplates, REST fetch. <ins-faceplate> v3 uses the domain FaceplateApi (getFaceplateByName/Svg/Elements/Placeholders) — requires backend build ≥ 20260706-8.",
   "type": "module",
   "main": "src/index.js",
   "files": [

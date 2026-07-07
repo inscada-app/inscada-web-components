@@ -21,7 +21,7 @@ import InsFaceplate from './ins-faceplate.js';
 import InsFetch from './ins-fetch.js';
 
 import {
-  setConfig, getConfig, getTransport, setTransport, Transport, ASSET_READER_CODE,
+  setConfig, getConfig, getTransport, setTransport, Transport,
 } from './transport/index.js';
 
 if (typeof customElements !== 'undefined') {
@@ -54,5 +54,4 @@ export {
   setTransport,
   setConfig,
   getConfig,
-  ASSET_READER_CODE,
 };

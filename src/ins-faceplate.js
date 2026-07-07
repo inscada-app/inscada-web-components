@@ -1,64 +1,59 @@
 /**
- * <ins-faceplate> v2 — iframe-first faceplate renderer for inSCADA Custom HTML.
+ * <ins-faceplate> v3 — domain-API-only faceplate renderer.
  *
- * v2 design decisions (2026-07-05):
- * - **Inline metadata.** Faceplate elements + placeholders come with the tag
- *   (`metadata` attribute JSON, or a `<script type="application/json">` child).
- *   No runtime `/api/faceplates/*` fetch — those endpoints are blocked on the
- *   sandbox port by `SandboxPortSecurityFilter`. Callers (typically an LLM
- *   using the Cloud MCP faceplate tools) fetch metadata at design time and
- *   embed concrete JSON.
- * - **SVG via sandbox-safe assets.** Path resolves under
- *   `/api/custom-html/assets/<svg-path>` — the only file route allowed inside
- *   the Custom HTML iframe.
- * - **Client-side expression eval.** Expressions run in a `new Function()`
- *   with an `ins` shim that reads a poll cache. The backend script runner is
- *   blocked in the sandbox and — more importantly — is unnecessary here: the
- *   expressions inSCADA generates are Nashorn ES5 which the browser also
- *   understands. `ins.getVariableValue(name)` is fed from a batched
- *   `api.getVariableValues([...])` proxy call refreshed every `poll` ms.
- * - **Metadata is snake_case.** Matches the MCP tool output verbatim so the
- *   LLM can paste it in without renames (`dom_id`, `expression_type`, etc.).
+ * Attributes:
+ *   name       (required) inSCADA faceplate name
+ *   project    (required) inSCADA project name — used for the InscadaApi context
+ *   poll       (optional) live-tag refresh interval in ms (default 2000, min 200)
+ *   debug      (optional) console.warn on missing element / resolver / bad JSON
+ *   width      (optional) inline CSS width
+ *   height     (optional) inline CSS height
+ *   <any-other-name>=<value>  →  placeholder override — mirrors the "attr =
+ *                               placeholder value" convention. If the DB has
+ *                               a placeholder `brand`, then attribute
+ *                               `brand="Siemens 7SJ82"` overrides its default.
  *
- * Preserved from v1:
- *   Shadow DOM isolation, attribute → placeholder value collection,
- *   9-type element handlers (Get/Color/Opacity/Visibility/Rotate/Bar/Blink/
- *   Move/Scale), Color blink split (`c1/c2`).
+ * Runtime pipeline:
+ *   1. connectedCallback yields to the parser (so attributes are all present).
+ *   2. transport.loadFaceplateFull(project, name) fetches def + svg + elements
+ *      + placeholders via the domain API (getFaceplateByName / getFaceplateSvg
+ *      / getFaceplateElements / getFaceplatePlaceholders — backend
+ *      commit 617709390, live 2026-07-06).
+ *      In iframe mode the calls go through InscadaApi's postMessage proxy;
+ *      in standalone mode they hit the REST endpoints directly.
+ *   3. SVG is injected as inline light DOM (no <object>, no Shadow DOM).
+ *   4. Placeholder values collected from tag attributes.
+ *   5. Placeholders of type=`tag` derive the live tag poll list; a batched
+ *      api.getVariableValues([...]) refreshes them every `poll` ms.
+ *   6. Elements iterate; each dom_id looks up a resolver registered via
+ *      setResolvers({dom_id: fn}). The resolver receives (insShim, phValues)
+ *      and returns the value we hand to the element-type handler
+ *      (Get/Color/Opacity/Visibility/Rotate/Bar/Blink/Move/Scale).
  *
- * Deferred to a later revision:
- *   Nested Faceplate rendering, `client_api:true` types (Chart / Datatable /
- *   Slider / Peity), API-mode metadata fetch (needs a sandbox-allowed
- *   `/api/faceplates/{id}/render` endpoint).
+ * Sandbox CSP note:
+ *   `unsafe-eval` is NOT granted, so we never `new Function(body)`. Element
+ *   expressions from the DB are surfaced to the caller (via getElementDefs())
+ *   but interpreting them is the caller's responsibility — supply pre-written
+ *   resolver functions instead of stringly-typed code.
  *
  * Usage:
- *   <ins-faceplate
- *     svg-path="faceplates/H01_FeederTemplate.svg"
- *     project="PALANDOKEN_GES"
- *     brand="Siemens 7SJ82"
- *     cb_status="CB01_STATUS"
- *     poll="2000">
- *     <script type="application/json">
- *       {
- *         "placeholders": [
- *           {"name":"brand","type":"text"},
- *           {"name":"cb_status","type":"tag"}
- *         ],
- *         "elements": [
- *           {"dom_id":"label","type":"Get","expression_type":"EXPRESSION",
- *            "expression":"return '$brand$';","props":"{}"},
- *           {"dom_id":"cb_body","type":"Color","expression_type":"EXPRESSION",
- *            "expression":"return ins.getVariableValue('$cb_status$').value ? '#0c0' : '#c00';",
- *            "props":"{\"property\":\"fill\"}"}
- *         ]
- *       }
- *     </script>
+ *   <ins-faceplate name="H01" project="PALANDOKEN_GES"
+ *                  brand="Siemens 7SJ82" cb_status="CB01_STATUS" poll="2000">
  *   </ins-faceplate>
+ *
+ *   <script>
+ *     const fp = document.querySelector('ins-faceplate');
+ *     fp.setResolvers({
+ *       label:   (ins, ph) => ph.brand,
+ *       cb_body: (ins, ph) => ins.getVariableValue(ph.cb_status).value ? '#0c0' : '#c00',
+ *     });
+ *   </script>
  */
 
-import { getTransport, ASSET_READER_CODE } from './transport/index.js';
+import { getTransport } from './transport/index.js';
 
 const RESERVED_ATTRS = new Set([
-  'svg-path', 'svg-content', 'metadata', 'project', 'poll',
+  'name', 'project', 'poll',
   'width', 'height', 'style', 'class', 'id', 'debug',
 ]);
 
@@ -75,7 +70,6 @@ export default class InsFaceplate extends HTMLElement {
     // pre-written resolver functions keyed by dom_id via setResolvers().
     this._api = null;
     this._svgRoot = null;
-    this._svgObject = null;
     this._elementDefs = [];
     this._placeholderDefs = [];
     this._placeholders = {};       // { brand: 'Siemens 7SJ82', ... } — keyed by RAW attr name (not $wrapped$)
@@ -85,8 +79,7 @@ export default class InsFaceplate extends HTMLElement {
     this._timer = null;
     this._observer = null;
     this._debug = false;
-    this._metadataCache = null;
-    this._inlineSvgCache = null;
+    this._def = null;              // FaceplateResponseDto
   }
 
   // We handle every attribute change through a MutationObserver so runtime
@@ -97,18 +90,6 @@ export default class InsFaceplate extends HTMLElement {
 
   async connectedCallback() {
     this._debug = this.hasAttribute('debug');
-    // Yield to the HTML parser so light-DOM children (metadata <script>,
-    // inline <template>) have a chance to be inserted. connectedCallback
-    // fires when the element is inserted, which for the parser path is
-    // BEFORE its children are parsed — reading them here returns null.
-    // A single macrotask boundary is enough for a straight-line subtree.
-    if (this.childNodes.length === 0 && document.readyState === 'loading') {
-      await new Promise(function (r) { setTimeout(r, 0); });
-    }
-    // Read metadata + optional inline SVG BEFORE we wipe children in
-    // _renderShell().
-    this._metadataCache = this._readMetadataFromDom();
-    this._inlineSvgCache = this._readInlineSvgFromDom();
     this._renderShell();
     this._observeAttrs();
     await this._init();
@@ -118,11 +99,6 @@ export default class InsFaceplate extends HTMLElement {
     this._stopPolling();
     this._clearBlinks();
     if (this._observer) { this._observer.disconnect(); this._observer = null; }
-    // Detach the <object> so pending network for it dies with us.
-    if (this._svgObject && this._svgObject.parentNode) {
-      this._svgObject.parentNode.removeChild(this._svgObject);
-    }
-    this._svgObject = null;
     this._svgRoot = null;
   }
 
@@ -134,8 +110,8 @@ export default class InsFaceplate extends HTMLElement {
   }
 
   _onAttrChange(mutations) {
-    if (!this._svgRoot && !this._svgObject) return;
-    const structural = ['svg-path', 'svg-content', 'metadata', 'project'];
+    if (!this._svgRoot) return;
+    const structural = ['name', 'project'];
     let restart = false, pollChanged = false, phChanged = false;
     for (const m of mutations) {
       const n = String(m.attributeName || '').toLowerCase();
@@ -186,140 +162,57 @@ export default class InsFaceplate extends HTMLElement {
   async _init() {
     this._stopPolling();
     this._clearBlinks();
-    if (this._svgObject && this._svgObject.parentNode) {
-      this._svgObject.parentNode.removeChild(this._svgObject);
-    }
-    this._svgObject = null;
     this._svgRoot = null;
 
-    const meta = this._readMetadata();
-    if (!meta) {
-      return this._err('Missing metadata. Provide it as a `metadata` attribute (JSON string) or a `<script type="application/json">` child.');
-    }
-    this._placeholderDefs = Array.isArray(meta.placeholders) ? meta.placeholders : [];
-    this._elementDefs = Array.isArray(meta.elements) ? meta.elements : [];
+    const project = this.getAttribute('project');
+    const name = this.getAttribute('name');
+    if (!project) return this._err('`project` attribute is required.');
+    if (!name)    return this._err('`name` attribute is required.');
 
+    let full;
     try {
-      await this._loadSvg();
-      if (!this._svgRoot) return this._err('SVG source produced no <svg> root element.');
+      full = await getTransport().loadFaceplateFull(project, name);
     } catch (e) {
-      return this._err('SVG load failed: ' + (e && e.message || e));
+      return this._err('Faceplate load failed: ' + (e && e.message || e));
     }
+
+    this._def = full.def || null;
+    this._placeholderDefs = Array.isArray(full.placeholders) ? full.placeholders : [];
+    this._elementDefs = Array.isArray(full.elements) ? full.elements : [];
+
+    const svg = full.svg;
+    if (typeof svg !== 'string' || svg.indexOf('<svg') < 0) {
+      return this._err('Faceplate "' + name + '" has no SVG content.');
+    }
+    const wrap = this.querySelector('.ins-fp-wrap');
+    wrap.innerHTML = svg;
+    const root = wrap.querySelector('svg');
+    if (!root) return this._err('Loaded SVG has no <svg> root element.');
+    root.style.width = '100%';
+    root.style.height = '100%';
+    root.style.display = 'block';
+    this._svgRoot = root;
 
     this._placeholders = this._collectPlaceholderValues();
     this._api = this._resolveApi();
     this._deriveTagsToPoll();
 
-    if (this._tagsToPoll.length > 0 && !this._api) {
-      if (this._debug) {
-        console.warn(
-          '[ins-faceplate] window.InscadaApi not found; live tag values will ' +
-          'be null until the InscadaApi proxy is available.'
-        );
-      }
+    if (this._tagsToPoll.length > 0 && !this._api && this._debug) {
+      console.warn(
+        '[ins-faceplate] window.InscadaApi not found; live tag values will ' +
+        'be null until the InscadaApi proxy is available.'
+      );
     }
 
-    if (this._tagsToPoll.length === 0) {
-      this._tick();
-    } else {
-      this._startPolling();
-    }
+    if (this._tagsToPoll.length === 0) this._tick();
+    else this._startPolling();
   }
 
-  // In-init lookup: prefer a live `metadata` attribute (may have changed),
-  // else fall back to the cached copy captured from the light-DOM child at
-  // connect time.
-  _readMetadata() {
-    const attr = this.getAttribute('metadata');
-    if (attr && attr.trim().length > 0) {
-      try { return JSON.parse(attr); }
-      catch (e) { this._err('metadata attribute JSON parse error: ' + e.message); return null; }
-    }
-    return this._metadataCache;
-  }
+  /* ── read accessors — expose DB-fetched metadata for caller code ── */
 
-  // Reads a light-DOM `<template>` child once (before _renderShell wipes it)
-  // and returns its innerHTML — expected to contain a full <svg>…</svg>
-  // element. This is the CSP-safe alternative to `svg-path` for iframe-hosted
-  // Custom HTML: backend serves the SVG asset with a `frame-ancestors` CSP
-  // that excludes the sandbox port, so `<object data="…">` framing is
-  // blocked at load time. Embedding the SVG in the light DOM sidesteps that
-  // entirely — parsed as HTML, no framing, no CSP.
-  _readInlineSvgFromDom() {
-    const t = this.querySelector('template.ins-fp-svg') ||
-              this.querySelector('template[data-role="svg"]') ||
-              this.querySelector('template');
-    if (t && t.innerHTML && t.innerHTML.trim().length > 0) return t.innerHTML;
-    return null;
-  }
-
-  // Reads the light-DOM `<script type="application/json">` child once, before
-  // _renderShell() replaces the children. Returns null if neither the attr
-  // nor a child script is present.
-  _readMetadataFromDom() {
-    const attr = this.getAttribute('metadata');
-    if (attr && attr.trim().length > 0) {
-      try { return JSON.parse(attr); }
-      catch (e) { this._err('metadata attribute JSON parse error: ' + e.message); return null; }
-    }
-    const script = this.querySelector('script[type="application/json"]');
-    if (script && script.textContent.trim().length > 0) {
-      try { return JSON.parse(script.textContent); }
-      catch (e) { this._err('metadata <script> JSON parse error: ' + e.message); return null; }
-    }
-    return null;
-  }
-
-  /**
-   * Load the SVG source and inject it as inline DOM under `.ins-fp-wrap`.
-   *
-   * Three sources, in priority order:
-   *   1. `svg-content` attribute (inline literal string).
-   *   2. Cached inline SVG from a `<template class="ins-fp-svg">` child.
-   *   3. `svg-path` — asset relative to the space file store (e.g.
-   *      `faceplates/H01.svg`). Resolves via `transport.loadPublishedFile`.
-   *
-   * Why not `<object data="/api/custom-html/assets/…">` (the pre-v2 approach):
-   * the Custom HTML iframe's CSP `frame-ancestors 'self' <mainOrigin>` does
-   * NOT include the sandbox port, so `<object>` framing is browser-blocked
-   * even for same-origin allowlisted assets. `<img>` renders but has no JS
-   * access to the SVG DOM tree.
-   *
-   * Why not `api.readPublishedFile(path)` directly: it exists on newer builds
-   * but crashes on the parent SPA's unconditional JSON.parse (Spring writes
-   * String returns as raw text). See tools/BUG_scripts_callapi_raw_string_response.md.
-   *
-   * The transport encapsulates the workaround (asset_reader server-side
-   * script wraps the string in a Map so Jackson JSON-encodes it). When
-   * Muhammed's fix lands, only the transport method changes — the component
-   * doesn't care.
-   */
-  async _loadSvg() {
-    const wrap = this.querySelector('.ins-fp-wrap');
-
-    const inline = this.getAttribute('svg-content') || this._inlineSvgCache;
-    if (inline) {
-      this._injectSvgString(wrap, inline);
-      return;
-    }
-
-    const path = this.getAttribute('svg-path');
-    if (!path) throw new Error('svg-path or svg-content attribute required');
-
-    const project = this.getAttribute('project');
-    const svgString = await getTransport().loadPublishedFile(project, path);
-    this._injectSvgString(wrap, svgString);
-  }
-
-  _injectSvgString(wrap, svgString) {
-    wrap.innerHTML = svgString;
-    const root = wrap.querySelector('svg');
-    if (!root) throw new Error('Loaded content has no <svg> root element.');
-    root.style.width = '100%';
-    root.style.height = '100%';
-    root.style.display = 'block';
-    this._svgRoot = root;
-  }
+  getDefinition()   { return this._def; }
+  getElementDefs()  { return this._elementDefs.slice(); }
+  getPlaceholderDefs() { return this._placeholderDefs.slice(); }
 
   /**
    * All non-reserved attributes become placeholder values, keyed by RAW
@@ -627,9 +520,3 @@ export default class InsFaceplate extends HTMLElement {
     for (const el of all) this._clearBlink(el);
   }
 }
-
-// Re-export the source of the server-side 'asset_reader' script so callers
-// can console.log(InsFaceplate.ASSET_READER_CODE) and paste it into a new
-// Repeatable Script in their inSCADA project. Iframe mode's svg-path loading
-// depends on this script existing; standalone mode does not.
-InsFaceplate.ASSET_READER_CODE = ASSET_READER_CODE;
